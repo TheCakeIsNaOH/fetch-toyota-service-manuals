@@ -9,7 +9,7 @@ import {jar} from "./api/client";
 import dayjs from "dayjs";
 
 export interface Manual {
-  type: "em" | "rm" | "bm" | "ncf" | "cr";
+  type: "em" | "rm" | "bm" | "ncf" | "cr" | "ewd" | "brm";
   id: string; // e.g. EM1234
   year?: number; // e.g. 2019
   raw: string; // e.g. EM1234@2019
@@ -48,6 +48,15 @@ async function run({manual, email, password, headed, cookieString}: CLIArgs) {
         });
         return;
       }
+      case "EW": {
+        genericManuals.push({
+          type: "ewd",
+          id,
+          year,
+          raw: m,
+        });
+        return;
+      }
       case "RM": {
         genericManuals.push({
           type: "rm",
@@ -58,6 +67,15 @@ async function run({manual, email, password, headed, cookieString}: CLIArgs) {
         return;
       }
       case "BM": {
+        genericManuals.push({
+          type: "cr",
+          id,
+          year,
+          raw: m,
+        });
+        return;
+      }
+      case "BR": {
         genericManuals.push({
           type: "cr",
           id,
