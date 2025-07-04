@@ -71,7 +71,11 @@ export default async function downloadEWD(manualData: Manual, path: string) {
         responseType: isPdf ? "stream" : "text",
       });
 
-      const filePath = join(partPath, `${fileName}.${fileExt}`);
+      const sanitizedName1 = fileName.replace(/<|>|\/|\\/g, "-");
+      const sanitizedName2 = sanitizedName1.replace(/\"|\*/g, "'");
+      const sanitizedName3 = sanitizedName2.replace(/:|\|/g, ";");
+      const sanitizedName = sanitizedName3.replace(/\?/g, "¿");
+      const filePath = join(partPath, `${sanitizedName}.${fileExt}`);
       if (isPdf) {
         // response is stream, save as such
         await saveStream(fileReq.data, filePath);
