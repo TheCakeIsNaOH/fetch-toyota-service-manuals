@@ -1,25 +1,34 @@
-import processCLIArgs, {CLIArgs} from "./processCLIArgs";
-import login from "./api/login";
-import {join, resolve} from "path";
-import {mkdir, readFile, writeFile} from "fs/promises";
-import downloadEWD from "./ewd";
-import downloadGenericManual from "./genericManual";
-import {chromium, Cookie} from "playwright";
-import {jar} from "./api/client";
+// =================================================================
+// Forcefully disable SSL certificate verification for this process
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+// =================================================================
+
+import { chromium } from "playwright-extra";
+import { Browser, Cookie } from "playwright";
+import processCLIArgs, { CLIArgs } from "./processCLIArgs";
+import { join, resolve } from "path";
+import { mkdir, readFile, writeFile, stat } from "fs/promises";
+import downloadGenericManual, { DownloadStats } from "./genericManual";
+import { jar } from "./api/client";
 import dayjs from "dayjs";
+import { shutdownManager } from "./state";
 
 export interface Manual {
   type: "em" | "rm" | "bm";
-  id: string; // e.g. EM1234
-  year?: number; // e.g. 2019
-  raw: string; // e.g. EM1234@2019
+  id: string;
+  year?: number;
+  raw: string;
 }
 
-async function run({manual, email, password, headed, cookieString}: CLIArgs) {
-  // sort manuals and make sure that they're valid (ish)
-  const ewds: Manual[] = [];
-  const genericManuals: Manual[] = [];
+interface ExtendedCLIArgs extends CLIArgs {
+    mode?: "fresh" | "resume" | "overwrite";
+}
 
+async function run(args: ExtendedCLIArgs) {
+  // Read the cookie string from the environment variable
+  const cookieString = process.env.TIS_COOKIE_STRING;
+  const { manual, mode = "resume" } = args;
+  const genericManuals: Manual[] = [];
   const rawManualIds = new Set(manual.map((m) => m.toUpperCase().trim()));
 
   console.log("Parsing manual IDs...");
@@ -27,188 +36,153 @@ async function run({manual, email, password, headed, cookieString}: CLIArgs) {
     const id = m.includes("@") ? m.split("@")[0] : m;
     const year = m.includes("@") ? parseInt(m.split("@")[1]) : undefined;
 
-    if (year && year !== -1) {
-      if (isNaN(year)) {
-        console.error(`Invalid manual ${m}: the model year must be a number.`);
-        process.exit(1);
-      } else {
-        console.log(
-          `Detected a manual with a year: ${m} (${year}). We'll try to download only manual pages that pertain to that year, but can't guarantee that it'll work.`
-        );
-      }
-    }
-
     switch (m.slice(0, 2).toUpperCase()) {
-      case "EM": {
-        ewds.push({
-          type: "em",
-          id,
-          year,
-          raw: m,
-        });
-        return;
-      }
-      case "RM": {
+      case "EM":
+      case "RM":
+      case "BM":
         genericManuals.push({
-          type: "rm",
+          type: m.slice(0, 2).toLowerCase() as "em" | "rm" | "bm",
           id,
           year,
           raw: m,
         });
         return;
-      }
-      case "BM": {
-        genericManuals.push({
-          type: "bm",
-          id,
-          year,
-          raw: m,
-        });
-        return;
-      }
-      default: {
+      default:
         console.error(
           `Invalid manual ${m}: manual IDs must start with EM, RM, or BM.`
         );
         process.exit(1);
-      }
     }
   });
 
-  // create directories
-  const dirPaths: { [manualId: string]: string } = Object.fromEntries(
-    [...ewds, ...genericManuals].map((m) => [
-      m.id,
-      resolve(join(".", "manuals", m.raw)),
-    ])
+  let dirPaths: { [manualId: string]: string } = Object.fromEntries(
+    genericManuals.map((m) => [m.id, resolve(join(".", "manuals", m.raw))])
   );
 
-  try {
-    await Promise.all(
-      Object.values(dirPaths).map((m) => mkdir(m, {recursive: true}))
-    );
-  } catch (e: any) {
-    if (e.code !== "EEXIST") {
-      console.error(`Error creating directory: ${e}`);
-      process.exit(1);
-    }
+  if (mode === 'fresh') {
+      console.log("Mode: Fresh Download. Creating versioned folders...");
+      const datePrefix = new Date().toISOString().split('T')[0];
+      
+      const versionedDirPaths: { [manualId: string]: string } = {};
+      for (const m of genericManuals) {
+          let versionedPath = resolve(join(".", "manuals", `${datePrefix}_${m.raw}`));
+          let counter = 1;
+          while (true) {
+              try {
+                  await stat(versionedPath);
+                  versionedPath = resolve(join(".", "manuals", `${datePrefix}_${m.raw}_(${++counter})`));
+              } catch (e) { break; }
+          }
+          versionedDirPaths[m.id] = versionedPath;
+      }
+      dirPaths = versionedDirPaths;
+  } else {
+      console.log(`Mode: ${mode.charAt(0).toUpperCase() + mode.slice(1)}.`);
   }
 
-  // copy accessor into manuals
-  console.log("Copying accessor into manuals...")
+  await Promise.all(
+    Object.values(dirPaths).map((m) => mkdir(m, { recursive: true }))
+  );
+
+  console.log("Copying accessor into manuals...");
   try {
     const accessorHTML = await readFile(join(__dirname, "..", "accessor/index.html"), "utf-8");
     await Promise.all(
-      Object.values(dirPaths).map((m) => writeFile(join(m, "index.html"), accessorHTML)));
+      Object.values(dirPaths).map((m) => writeFile(join(m, "index.html"), accessorHTML))
+    );
   } catch (e) {
-    console.error("Unable to copy accessor file into manuals.", e)
+    console.error("Unable to copy accessor file into manuals.", e);
   }
 
-  console.log("Setting up Playwright...");
-  const browser = await chromium.launch({
-    headless: !headed,
+  console.log("Setting up STEALTH Playwright...");
+  const browser: Browser = await chromium.launch({
+    headless: false,
+    args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
+    ]
   });
+
+  const cleanup = async () => {
+    shutdownManager.isShuttingDown = true;
+    console.log("\nCaught interrupt signal. Shutting down gracefully...");
+    if (browser) {
+      await browser.close();
+      console.log("Browser closed.");
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
 
   let transformedCookies: Cookie[] = [];
 
-  if (email && password) {
-    console.log("Logging into TIS using email and password...");
-    // login and get cookies
-    try {
-      await login(email, password);
-    } catch (e: any) {
-      console.log("Error logging in. Please check your username and password.");
-      console.log(e.toString());
-      return;
-    }
-
-    transformedCookies = jar.toJSON().cookies.map((c) => ({
-      name: c.key,
-      value: c.value,
-      domain: "techinfo.toyota.com",
-      // for some reason, we have to do this-- otherwise, the iPlanetDirectoryPro
-      // cookie isn't sent, which means that the session isn't working
-      secure: true,
-      sameSite: "None",
-      path: c.path,
-      httpOnly: false,
-      // expires: c.expires ? dayjs(c.expires).unix() : dayjs().add(1, "day").unix()
-      expires: dayjs().add(1, "day").unix(),
-    }));
-  } else if (cookieString) {
-    console.log("Using cookies from command line...");
-
-    // parse cookie string
-    const cookieStrings = cookieString.split("; ");
-    // transform cookie strings into cookie objects
+  if (cookieString) {
+    console.log("Using cookies from environment variable...");
+    const cookieStrings = cookieString.split(';').map(c => c.trim());
+    
     transformedCookies = cookieStrings.map((c) => {
-      const [name, value] = c.split("=");
-      return {
-        name,
-        value,
-        domain: "techinfo.toyota.com",
-        // for some reason, we have to do this-- otherwise, the iPlanetDirectoryPro
-        // cookie isn't sent, which means that the session isn't working
-        secure: true,
-        sameSite: "None",
-        path: "/",
-        httpOnly: false,
-        expires: dayjs().add(1, "day").unix(),
-      };
+      const firstEqual = c.indexOf('=');
+      const name = c.substring(0, firstEqual);
+      const value = c.substring(firstEqual + 1);
+      return { name, value, domain: ".toyota.com", path: "/", expires: dayjs().add(1, "day").unix(), httpOnly: false, secure: true, sameSite: "None" };
     });
 
-    // add cookies to axios jar
-    transformedCookies.forEach((c) => {
-      jar.setCookieSync(
-        `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path}; Expires=${c.expires}; Secure; SameSite=None`,
-        "https://techinfo.toyota.com/t3Portal/"
-      );
+    console.log("Populating axios cookie jar...");
+    cookieStrings.forEach(cookie => {
+        if (cookie) {
+            jar.setCookieSync(cookie, 'https://techinfo.toyota.com');
+        }
     });
+
   } else {
-    console.log(
-      "No credentials provided. Please provide either a cookie string or email/password."
-    );
+    console.log("No cookie string provided via environment variable. Aborting.");
     process.exit(1);
   }
 
-  const page = await browser.newPage({
-    acceptDownloads: false,
-    storageState: {
-      // add cookies to browser
-      cookies: transformedCookies,
-      origins: [],
-    },
+  const context = await browser.newContext({
+    storageState: { cookies: transformedCookies, origins: [] },
+    viewport: { width: 1920, height: 1080 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
   });
 
-  console.log("Checking that Playwright is logged in...");
-  const resp = await page.goto("https://techinfo.toyota.com/t3Portal/", {
-    waitUntil: "commit",
-  });
-  if (!resp || !resp.url().endsWith("t3Portal/")) {
-    throw new Error(
-      `Doesn't appear we're logged into TIS, we're at ${
-        resp ? resp.url() : "unknown URL"
-      }`
-    );
+  const page = await context.newPage();
+
+  console.log("Checking that Playwright is logged in by validating cookie...");
+  try {
+    await page.goto("https://techinfo.toyota.com/t3Portal/");
+    if (page.url().includes("login.toyota.com")) {
+      console.error("\nERROR: Cookie validation failed. You were redirected to a login page.");
+      await browser.close();
+      process.exit(1);
+    }
+    console.log("Cookie appears to be valid. Proceeding with downloads.");
+  } catch (e) {
+      console.error("An error occurred during cookie validation:", e);
+      await browser.close();
+      process.exit(1);
   }
 
   console.log("Beginning manual downloads...");
-  // begin downloads
-  for (const ewdIdx in ewds) {
-    const ewd = ewds[ewdIdx];
-    console.log(`Downloading ${ewd.raw}... (type = ewd)`);
-    await downloadEWD(ewd, dirPaths[ewd.id]);
+  const totalStats: DownloadStats = { downloaded: 0, skipped: 0, failed: 0 };
+
+  for (const manual of genericManuals) {
+    console.log(`\nDownloading ${manual.raw}...`);
+    const manualStats = await downloadGenericManual(page, manual, dirPaths[manual.id], mode);
+    totalStats.downloaded += manualStats.downloaded;
+    totalStats.skipped += manualStats.skipped;
+    totalStats.failed += manualStats.failed;
   }
 
-  // download other manuals - requires playwright
-  for (const manualIdx in genericManuals) {
-    const manual = genericManuals[manualIdx];
+  console.log("\n--- Download Complete ---");
+  console.log(`✅ Downloaded: ${totalStats.downloaded}`);
+  console.log(`⏩ Skipped:    ${totalStats.skipped}`);
+  console.log(`❌ Failed:     ${totalStats.failed}`);
+  console.log("-------------------------");
 
-    console.log(`Downloading ${manual.raw}... (type = generic)`);
-    await downloadGenericManual(page, manual, dirPaths[manual.id]);
-  }
-
-  console.log("All manuals downloaded!");
+  await browser.close();
   process.exit(0);
 }
 

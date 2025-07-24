@@ -1,117 +1,139 @@
 import { AxiosResponse } from "axios";
 import { client } from "../api/client";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, stat } from "fs/promises";
 import { join } from "path";
 import parseToC, { ParsedToC } from "./parseToC";
 import { Page } from "playwright";
 import { Manual } from "..";
+import saveStream from "../api/saveStream";
+import { shutdownManager } from "../state";
+
+export interface DownloadStats {
+  downloaded: number;
+  skipped: number;
+  failed: number;
+}
 
 export default async function downloadGenericManual(
   page: Page,
   manualData: Manual,
-  path: string
-) {
-  // download ToC
+  path: string,
+  mode: "fresh" | "resume" | "overwrite"
+): Promise<DownloadStats> {
   let tocReq: AxiosResponse;
   try {
-    console.log("Downloading table of contents...");
+    console.log("  - Downloading table of contents...");
+    // =================================================================
+    // REVERTED to the proven logic from your working backup
+    // =================================================================
     tocReq = await client({
       method: "GET",
       url: `${manualData.type}/${manualData.id}/toc.xml`,
-      // we don't want axios to parse this
       responseType: "text",
     });
   } catch (e: any) {
+    if (shutdownManager.isShuttingDown) return { downloaded: 0, skipped: 0, failed: 0 };
     if (e.response && e.response.status === 404) {
-      throw new Error(
-        `Manual ${manualData.id} doesn't appear to exist-- are you sure the ID is right?`
-      );
+      throw new Error(`Manual ${manualData.id} doesn't exist.`);
     }
-
-    throw new Error(
-      `Unknown error getting title XML for manual ${manualData.raw}: ${e}`
-    );
+    const responseData = e.response?.data || "No response data available.";
+    console.error("CRITICAL: Failed to download the Table of Contents. The server likely returned an HTML error page instead of XML.");
+    console.error("--- Start of Server Response ---");
+    console.log(responseData);
+    console.error("--- End of Server Response ---");
+    throw new Error(`Unknown error getting table of contents: ${e.message}`);
   }
 
   const files = parseToC(tocReq.data, manualData.year);
+  await writeFile(join(path, "toc.js"), `document.toc = ${JSON.stringify(files, null, 2)};`);
 
-  // write to disk
-  console.log("Saving table of contents...");
-  await Promise.all([
-    writeFile(join(path, "toc-full.xml"), tocReq.data),
-    writeFile(
-      join(path, "toc-downloaded.json"),
-      JSON.stringify(files, null, 2)
-    ),
-    writeFile(
-      join(path, "toc.js"),
-      `document.toc = JSON.parse(\`${JSON.stringify(files).replaceAll(
-        '\\"',
-        ""
-      )}\`);`
-    ),
-  ]);
-
-  console.log("Downloading full manual...");
-  await recursivelyDownloadManual(page, path, files);
+  console.log("  - Downloading all PDF files...");
+  const stats = await recursivelyDownloadManual(page, path, files, mode);
+  
+  return stats;
 }
 
 async function recursivelyDownloadManual(
   page: Page,
   path: string,
-  toc: ParsedToC
-) {
-  const exploded = Object.entries(toc);
-
-  for (const explIdx in exploded) {
-    const [name, value] = exploded[explIdx];
+  toc: ParsedToC,
+  mode: "fresh" | "resume" | "overwrite",
+  stats: DownloadStats = { downloaded: 0, skipped: 0, failed: 0 }
+): Promise<DownloadStats> {
+  const entries = Object.entries(toc);
+  for (const [index, [name, value]] of entries.entries()) {
+    if (shutdownManager.isShuttingDown) break;
 
     if (typeof value === "string") {
       const sanitizedName = name.replace(/\//g, "-");
-      const sanitizedPath = `${join(path, sanitizedName)}.pdf`;
-      console.log(`Downloading page ${sanitizedName}...`);
+      const filePath = `${join(path, sanitizedName)}.pdf`;
+      
+      const progress = `[${(index + 1).toString().padStart(3, ' ')}/${entries.length}]`;
+      
+      if (mode === 'resume') {
+          try {
+              const fileStats = await stat(filePath);
+              if (fileStats.size > 15 * 1024) {
+                console.log(`\x1b[33m${progress} ⏩ Skipping existing file: ${sanitizedName}.pdf\x1b[0m`);
+                stats.skipped++;
+                continue;
+              }
+          } catch (e) {
+              // File does not exist, so proceed with download.
+          }
+      }
 
-      // download page
+      console.log(`${progress} Processing: ${sanitizedName}...`);
+      const htmlUrl = `https://techinfo.toyota.com${value}`;
+
       try {
-        await page.goto(`https://techinfo.toyota.com${value}`, {
-          waitUntil: "load",
+        await page.goto(htmlUrl, { timeout: 60000 });
+        const finalUrl = page.url();
+
+        if (!finalUrl.includes('.pdf')) {
+          throw new Error(`Page did not redirect to a PDF. Final URL: ${finalUrl}`);
+        }
+        
+        // =================================================================
+        // REVERTED to the proven logic from your working backup
+        // =================================================================
+        const pdfStreamResponse = await client.get(finalUrl, {
+            responseType: 'stream',
         });
-        await page.addScriptTag({
-          content: `document.querySelector(".footer").remove()`,
-        });
-        await page.pdf({
-          path: sanitizedPath,
-          margin: {
-            top: 1,
-            right: 1,
-            bottom: 1,
-            left: 1,
-          },
-        });
+
+        await saveStream(pdfStreamResponse.data, filePath);
+
+        const fileStats = await stat(filePath);
+        const fileSizeInKB = Math.round(fileStats.size / 1024);
+        
+        if (fileStats.size < 1) {
+            stats.failed++;
+            console.error(`\x1b[31m${progress} ❌ Error processing page ${name}: Downloaded file is empty (0 KB).\x1b[0m`);
+            continue;
+        }
+
+        console.log(`\x1b[32m${progress} ✅ Successfully saved ${sanitizedName}.pdf (${fileSizeInKB} KB)\x1b[0m`);
+
+        stats.downloaded++;
+
       } catch (e) {
-        console.error(`Error saving page ${name}: ${e}`);
+        if (shutdownManager.isShuttingDown) break;
+        stats.failed++;
+        console.error(`\x1b[31m${progress} ❌ Error processing page ${name}: ${(e as Error).message}\x1b[0m`);
         continue;
       }
-
-      // downloaded page, move on
-      continue;
+    } else {
+        const newPath = join(path, name.replace(/\//g, "-"));
+        try {
+          await mkdir(newPath, { recursive: true });
+        } catch (e) {
+          if ((e as any).code !== "EEXIST") {
+            console.log(`Could not create directory ${newPath}. Skipping section.`);
+            continue;
+          }
+        }
+        await recursivelyDownloadManual(page, newPath, value, mode, stats);
     }
-
-    // we're not at the bottom of the tree, continue
-
-    // create folder
-    const newPath = join(path, name.replace(/\//g, "-"));
-    if (newPath.includes("undefined")) debugger;
-    try {
-      await mkdir(newPath, { recursive: true });
-    } catch (e) {
-      if ((e as any).code === "EEXIST") {
-        console.log(
-          `Not creating folder ${newPath} because it already exists.`
-        );
-      }
-    }
-
-    await recursivelyDownloadManual(page, newPath, value);
   }
+  return stats;
 }
